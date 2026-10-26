@@ -1,0 +1,67 @@
+# =====================================================================
+#  IPL LAVANDERIE - Gestionale v8 - backup notturno del database
+#  File da creare nel repository privato: .github/workflows/backup.yml
+#  Segreto richiesto (Settings > Secrets and variables > Actions):
+#    SUPABASE_DB_URL = stringa di connessione "Session pooler" di Supabase
+#  Ogni notte: copia completa (formato PostgreSQL) + dati in CSV leggibile.
+#  Conserva: ultimi 7 giorni (uno per giorno della settimana) e una copia
+#  al mese per sempre. Tiene anche attivo il progetto Supabase gratuito.
+# =====================================================================
+name: Backup notturno IPL
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Installa il client PostgreSQL più recente
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Copia del database e dati in CSV
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          D=$(date -u +%Y-%m-%d)
+          pg_dump "$DB_URL" --schema=public --no-owner --no-privileges -Fc -f "ipl_$D.dump"
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -c "\copy (select coll, id, deleted, rev, updated_at, data from public.ipl_records order by coll, id) to 'ipl_dati_$D.csv' with csv header"
+          gzip -9 "ipl_dati_$D.csv"
+          psql "$DB_URL" -At -c "select coll || ': ' || count(*) from public.ipl_records where not deleted group by coll order by coll" > "conteggi_$D.txt"
+          cat "conteggi_$D.txt"
+          test -s "ipl_$D.dump"
+          SIZE=$(stat -c%s "ipl_$D.dump")
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -c "insert into public.ipl_backup_log(kind, detail) values ('github', 'copia notturna $D: $SIZE byte')"
+          echo "D=$D" >> "$GITHUB_ENV"
+
+      - name: Salva la copia del giorno (ultimi 7 giorni)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="giorno-$(date -u +%u)"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Copia del giorno $(date -u +%u) della settimana" --notes "Sovrascritta ogni settimana."
+          for f in $(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'); do gh release delete-asset "$TAG" "$f" -R "$GITHUB_REPOSITORY" -y; done
+          gh release upload "$TAG" "ipl_$D.dump" "ipl_dati_$D.csv.gz" "conteggi_$D.txt" -R "$GITHUB_REPOSITORY" --clobber
+
+      - name: Copia mensile permanente (il primo del mese o su richiesta)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$(date -u +%d)" != "01" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then echo "Non è il primo del mese"; exit 0; fi
+          TAG="mese-$(date -u +%Y-%m)"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Copia mensile $(date -u +%Y-%m)" --notes "Copia permanente: non viene mai cancellata."
+          gh release upload "$TAG" "ipl_$D.dump" "ipl_dati_$D.csv.gz" "conteggi_$D.txt" -R "$GITHUB_REPOSITORY" --clobber
